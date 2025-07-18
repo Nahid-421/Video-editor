@@ -4,20 +4,20 @@ import subprocess
 import threading
 import shutil
 import asyncio
-import json # Redis-এ ডেটা রাখার জন্য json ব্যবহার করব
+import sqlite3
+import json
 
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import redis # pymongo-এর পরিবর্তে redis
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- Configuration ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-REDIS_URL = os.getenv("REDIS_URL") # MONGO_URI-এর পরিবর্তে REDIS_URL
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+DB_NAME = 'bot_data.db' # ডেটাবেস ফাইলের নাম
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -26,52 +26,73 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Database Connection (Redis) ---
-try:
-    if not REDIS_URL:
-        raise ValueError("Missing REDIS_URL. Please check your environment variables.")
-    # Redis-এর সাথে কানেক্ট করা
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping() # কানেকশন ঠিক আছে কিনা চেক করা
-    logger.info("Redis successfully connected.")
-except Exception as e:
-    logger.error(f"Failed to connect to Redis: {e}")
-    redis_client = None
+# --- Database Setup (SQLite) ---
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # ব্যবহারকারীর তথ্য রাখার জন্য একটি টেবিল তৈরি করা
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            state TEXT,
+            data TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("SQLite database initialized.")
+
+# --- Database Helper Functions (Using SQLite) ---
+def set_user_data(user_id, state=None, data=None):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # প্রথমে ব্যবহারকারীর সব ডেটা পড়া
+    cursor.execute("SELECT data FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    current_data = json.loads(row[0]) if row and row[0] else {}
+
+    # নতুন ডেটা আপডেট করা
+    if data:
+        current_data.update(data)
+    
+    # ডেটাবেসে আবার সেভ করা
+    if state is not None:
+        cursor.execute("INSERT OR REPLACE INTO users (user_id, state, data) VALUES (?, ?, ?)", 
+                       (user_id, state, json.dumps(current_data)))
+    else:
+        # যদি শুধু ডেটা আপডেট হয় কিন্তু স্টেট না
+        cursor.execute("UPDATE users SET data = ? WHERE user_id = ?", (json.dumps(current_data), user_id))
+
+    conn.commit()
+    conn.close()
+
+def get_user_data(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT state, data FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        state, data_str = row
+        user_data = json.loads(data_str) if data_str else {}
+        user_data['state'] = state
+        return user_data
+    return {}
+
+def delete_user_data(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
 # --- User States ---
 STATE_AWAITING_MOVIE = 'awaiting_movie'
 STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 
-# --- Database Helper Functions (Using Redis) ---
-def set_user_data(user_id, state=None, data=None):
-    if not redis_client: return
-    # প্রথমে ব্যবহারকারীর সব ডেটা পড়া
-    user_key = f"user:{user_id}"
-    try:
-        current_data_str = redis_client.get(user_key)
-        current_data = json.loads(current_data_str) if current_data_str else {}
-    except (json.JSONDecodeError, TypeError):
-        current_data = {}
-
-    # নতুন ডেটা আপডেট করা
-    if state is not None:
-        current_data['state'] = state
-    if data:
-        current_data.update(data)
-    
-    # ডেটাবেসে আবার সেভ করা
-    redis_client.set(user_key, json.dumps(current_data))
-
-def get_user_data(user_id):
-    if not redis_client: return {}
-    user_key = f"user:{user_id}"
-    data_str = redis_client.get(user_key)
-    if data_str:
-        return json.loads(data_str)
-    return {}
-
-# --- Video Processing, Telegram Handlers, Flask App (এগুলোতে কোনো পরিবর্তন নেই) ---
+# --- Video Processing and Other Functions (কোনো পরিবর্তন নেই) ---
 # ... (আগের কোডের বাকি অংশ এখানে হুবহু একই থাকবে)
 # ... (আমি পুরোটা আবার পেস্ট করছি কনফিউশন এড়ানোর জন্য)
 
@@ -129,19 +150,17 @@ def process_video(user_id, chat_id, context):
         logger.error(f"Error processing for user {user_id}: {e}", exc_info=True)
         bot.send_message(chat_id, f"A critical error occurred. Press /start to try again.")
     finally:
-        if redis_client:
-            redis_client.delete(f"user:{user_id}")
+        delete_user_data(user_id)
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    set_user_data(user.id, state=STATE_AWAITING_MOVIE)
+    set_user_data(user.id, state=STATE_AWAITING_MOVIE, data={})
     await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nFirst, send me the main **movie file**.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if redis_client:
-        redis_client.delete(f"user:{update.effective_user.id}")
+    delete_user_data(update.effective_user.id)
     await update.message.reply_text("Process cancelled. Press /start to begin again.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,6 +187,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times.")
             threading.Thread(target=process_video, args=(user_id, chat_id, context)).start()
         else: await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
+
+# --- Flask Web App and Bot Setup ---
+init_db() # অ্যাপ শুরু হওয়ার সময় ডেটাবেস ফাইল তৈরি করা
 
 app = Flask(__name__)
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
