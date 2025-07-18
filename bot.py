@@ -101,6 +101,16 @@ STATE_PROCESSING = 'processing'
 def process_video(user_id, chat_id, context):
     bot = context.bot
     temp_dir = f"temp_{user_id}"
+
+    # <<<<<<< এই অংশটিই সব সমস্যার সমাধান >>>>>>>
+    # থ্রেডের ভেতর থেকে মেসেজ পাঠানোর জন্য একটি নিরাপদ ফাংশন
+    def send_sync_message(text):
+        try:
+            # প্রতিটি মেসেজের জন্য একটি নতুন asyncio loop তৈরি করা হচ্ছে
+            asyncio.run(bot.send_message(chat_id=chat_id, text=text))
+        except Exception as e:
+            logger.error(f"Error sending sync message in thread: {e}")
+
     try:
         user_data = get_user_data(user_id).get('data', {})
         movie_file_id = user_data.get('movie_file_id')
@@ -111,14 +121,14 @@ def process_video(user_id, chat_id, context):
             raise ValueError("Required data not found for processing.")
 
         os.makedirs(temp_dir, exist_ok=True)
-        bot.send_message(chat_id, "Downloading files... 📥 This may take a while.")
+        send_sync_message("Downloading files... 📥 This may take a while.")
         
         movie_path = os.path.join(temp_dir, 'movie.mp4')
-        (bot.get_file(movie_file_id)).download_to_drive(movie_path)
+        asyncio.run(bot.get_file(movie_file_id).download_to_drive(movie_path))
         ad_path = os.path.join(temp_dir, 'ad.mp4')
-        (bot.get_file(ad_file_id)).download_to_drive(ad_path)
+        asyncio.run(bot.get_file(ad_file_id).download_to_drive(ad_path))
         
-        bot.send_message(chat_id, "Download complete. Processing video... ⚙️ This is the longest step.")
+        send_sync_message("Download complete. Processing video... ⚙️ This is the longest step.")
 
         ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', movie_path]
         result = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
@@ -139,18 +149,18 @@ def process_video(user_id, chat_id, context):
             f.write(f"inpoint {ad_count * split_duration}\n")
 
         output_path = os.path.join(temp_dir, 'final_movie.mp4')
-        bot.send_message(chat_id, "Merging files... Please be patient.")
+        send_sync_message("Merging files... Please be patient.")
         
         ffmpeg_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', output_path]
         subprocess.run(ffmpeg_cmd, check=True)
 
-        bot.send_message(chat_id, "Processing complete! ✅\nUploading the file...")
+        send_sync_message("Processing complete! ✅\nUploading the file...")
         with open(output_path, 'rb') as final_video:
-            bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120)
+            asyncio.run(bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120))
 
     except Exception as e:
         logger.error(f"Error in process_video thread for user {user_id}:", exc_info=True)
-        bot.send_message(chat_id, f"A critical error occurred during processing. Please try again by sending /start.")
+        send_sync_message("A critical error occurred during processing. Please try again by sending /start.")
     finally:
         delete_user_data(user_id)
         if os.path.exists(temp_dir):
@@ -159,22 +169,17 @@ def process_video(user_id, chat_id, context):
 # --- টেলিগ্রাম হ্যান্ডলার ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"User {user.id} started the bot.")
     set_user_data(user.id, state=STATE_AWAITING_MOVIE, data_to_add={'user_id': user.id})
-    await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nI can add ads to your movies.\nFirst, send me the main **movie file**.")
+    await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nFirst, send me the main **movie file**.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    delete_user_data(user_id)
+    delete_user_data(update.effective_user.id)
     await update.message.reply_text("Process cancelled. You can start a new one by sending /start.")
 
 async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """শুধুমাত্র ভিডিও মেসেজ হ্যান্ডেল করার জন্য"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     state = user_data.get('state')
-    
-    logger.info(f"VIDEO message received from user {user_id}. Current state: {state}")
 
     if state == STATE_AWAITING_MOVIE:
         set_user_data(user_id, state=STATE_AWAITING_AD, data_to_add={'movie_file_id': update.message.video.file_id})
@@ -186,37 +191,31 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("I was not expecting a video. Please follow the instructions or start over with /start.")
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """শুধুমাত্র টেক্সট মেসেজ হ্যান্ডেল করার জন্য"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     state = user_data.get('state')
-
-    logger.info(f"TEXT message received from user {user_id}. Current state: {state}")
 
     if state == STATE_AWAITING_AD_COUNT:
         if update.message.text and update.message.text.isdigit() and int(update.message.text) > 0:
             count = int(update.message.text)
             set_user_data(user_id, state=STATE_PROCESSING, data_to_add={'ad_count': count})
+            await update.message.reply_text(f"Information received. Starting the process... You will be notified at each step.")
             threading.Thread(target=process_video, args=(user_id, update.effective_chat.id, context)).start()
-            await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times. You will be notified when it's done.")
         else:
-            await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0** (e.g., 1, 2, 3).")
+            await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
     elif state == STATE_PROCESSING:
-        await update.message.reply_text("I am currently processing your video. Please wait until it is complete.")
+        await update.message.reply_text("I am currently processing your video. Please wait.")
     else:
-        await update.message.reply_text("I was not expecting text now. Please follow the instructions or start over with /start.")
-
+        await update.message.reply_text("I was not expecting text now. Please start over with /start.")
 
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
 
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
-# <<<<<<<< এই অংশটি নতুন করে সাজানো হয়েছে >>>>>>>>
 bot_app.add_handler(CommandHandler("start", start_command))
 bot_app.add_handler(CommandHandler("cancel", cancel_command))
 bot_app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video_message))
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-# <<<<<<<< এই পর্যন্ত >>>>>>>>
 
 app = Flask(__name__)
 
