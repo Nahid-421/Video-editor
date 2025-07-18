@@ -74,85 +74,125 @@ async def process_videos(client, user_id):
     movie_msg = session.get("movie")
     ads_msg = session.get("ads", [])
 
-    # ভিডিও ডাউনলোড
-    movie_path = await movie_msg.download(file_name=f"movie_{user_id}.mp4")
+    movie_path = None
     ad_paths = []
-    for idx, ad in enumerate(ads_msg):
-        path = await ad.download(file_name=f"ad_{user_id}_{idx}.mp4")
-        ad_paths.append(path)
+    temp_segment_files = [] # ক্লিনআপের জন্য ফাইল লিস্ট
 
-    # ভিডিও মিক্সিং লজিক
     try:
+        await client.send_message(user_id, "🎬 মুভি ভিডিও ডাউনলোড হচ্ছে...")
+        movie_path = await movie_msg.download(file_name=f"movie_{user_id}.mp4")
+        await client.send_message(user_id, "📢 বিজ্ঞাপন ভিডিও ডাউনলোড হচ্ছে...")
+        for idx, ad in enumerate(ads_msg):
+            path = await ad.download(file_name=f"ad_{user_id}_{idx}.mp4")
+            ad_paths.append(path)
+        await client.send_message(user_id, "🔧 ভিডিও প্রসেসিং শুরু করছি...")
+
         duration = get_duration(movie_path)
+        if duration is None or duration == 0:
+            raise ValueError("মুভি ভিডিওর সময়কাল নির্ণয় করা যায়নি বা এটি অবৈধ।")
+
         segment_duration = duration // (len(ad_paths) + 1)
+        if segment_duration <= 0:
+            # এটি ঘটে যখন মুভি বিজ্ঞাপনের থেকে ছোট হয়
+            raise ValueError("ভিডিও সেগমেন্টের সময়কাল খুব কম বা শুন্য। অনুগ্রহ করে দীর্ঘতর মুভি ভিডিও পাঠান।")
+
 
         segments = []
 
-        # মুভি সেগমেন্ট এবং বিজ্ঞাপন ভিডিও ইন্টারলিভ করা
+        # movie segments + ads interleaved
         for i in range(len(ad_paths)):
             seg_file = f"segment_{user_id}_{i}.mp4"
+            await client.send_message(user_id, f"✂️ মুভি সেগমেন্ট {i+1} কাটা হচ্ছে...")
             cut_video(movie_path, segment_duration * i, segment_duration, seg_file)
             segments.append(seg_file)
+            temp_segment_files.append(seg_file)
             segments.append(ad_paths[i])
 
-        # মুভি শেষ সেগমেন্ট
+        # শেষ সেগমেন্ট
         last_seg = f"segment_{user_id}_last.mp4"
+        await client.send_message(user_id, "✂️ মুভি শেষ সেগমেন্ট কাটা হচ্ছে...")
         cut_video(movie_path, segment_duration * len(ad_paths), duration - (segment_duration * len(ad_paths)), last_seg)
         segments.append(last_seg)
+        temp_segment_files.append(last_seg)
 
-        # concat ফাইল তৈরি করা
+        # concat ফাইল তৈরি
         concat_file = f"concat_{user_id}.txt"
         with open(concat_file, "w") as f:
             for seg in segments:
                 f.write(f"file '{seg}'\n")
+        await client.send_message(user_id, "🔗 ভিডিওগুলো যুক্ত করা হচ্ছে...")
 
-        # ফাইনাল মিক্সড ভিডিও তৈরি
+        # ফাইনাল মিক্সড ভিডিও - অডিও-ভিডিও স্ট্রিম সরাসরি কপি করা হবে
         final_video = f"final_{user_id}.mp4"
         cmd = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file,
-            "-c", "copy", final_video, "-y"
+            "-c:v", "copy",  # ভিডিও স্ট্রিম কপি
+            "-c:a", "copy",  # অডিও স্ট্রিম কপি
+            "-y", final_video
         ]
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if process.returncode != 0:
+            print(f"FFmpeg Concat Error (User ID: {user_id}):\nSTDOUT: {process.stdout}\nSTDERR: {process.stderr}")
+            raise RuntimeError(f"ভিডিও যুক্ত করতে ব্যর্থ। ত্রুটি: {process.stderr[:500]}...")
+        else:
+            print(f"FFmpeg Concat Success (User ID: {user_id}):\nSTDOUT: {process.stdout}")
 
-        # ইউজারকে ভিডিও পাঠানো
+
+        # ভিডিও পাঠান ইউজারকে
         await client.send_video(user_id, final_video, caption="✅ বিজ্ঞাপনসহ মুভি প্রস্তুত হয়েছে!")
 
     except Exception as e:
-        # ত্রুটি হলে ইউজারকে জানানো
-        await client.send_message(user_id, f"❌ কিছু সমস্যা হয়েছে: {e}")
+        # বিস্তারিত ত্রুটি বার্তা ইউজারকে পাঠানো হচ্ছে
+        print(f"Error processing video for user {user_id}: {e}") # সার্ভার লগ
+        await client.send_message(user_id, f"❌ ভিডিও প্রসেস করতে সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন বা অন্য ভিডিও পাঠান। \n\nত্রুটি: `{e}`")
 
     finally:
-        # ফাইল ক্লিনআপ
-        cleanup_files = [movie_path, concat_file, final_video] + ad_paths + segments
+        # ক্লিনআপ
+        cleanup_files = [movie_path, concat_file, final_video] + ad_paths + temp_segment_files
         for f in cleanup_files:
-            try:
-                os.remove(f)
-            except:
-                pass
+            if f and os.path.exists(f): # ফাইলটি আছে কিনা পরীক্ষা করুন
+                try:
+                    os.remove(f)
+                    print(f"Cleaned up: {f}")
+                except Exception as e:
+                    print(f"Error cleaning up file {f}: {e}")
 
-        user_sessions.pop(user_id, None) # সেশন ডেটা মুছে ফেলা
+        user_sessions.pop(user_id, None)
 
-# ভিডিওর ডিউরেশন (সময়কাল) পাওয়ার ফাংশন
 def get_duration(path):
     import json
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
-         "json", path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
-    )
-    output = json.loads(result.stdout)
-    return int(float(output['format']['duration']))
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+             "json", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"FFprobe Error (Path: {path}):\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
+            return None
 
-# ভিডিও কাট করার ফাংশন
+        output = json.loads(result.stdout)
+        return int(float(output['format']['duration']))
+    except Exception as e:
+        print(f"Exception in get_duration for {path}: {e}")
+        return None
+
+
 def cut_video(input_file, start, duration, output_file):
     cmd = [
         "ffmpeg", "-ss", str(start), "-i", input_file, "-t", str(duration),
-        "-c", "copy", output_file, "-y"
+        "-c:v", "copy",  # ভিডিও স্ট্রিম কপি
+        "-c:a", "copy",  # অডিও স্ট্রিম কপি
+        output_file, "-y"
     ]
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if process.returncode != 0:
+        print(f"FFmpeg Cut Error (Input: {input_file}, Output: {output_file}):\nSTDOUT: {process.stdout}\nSTDERR: {process.stderr}")
+        raise RuntimeError(f"ভিডিও কাট করতে ব্যর্থ। ত্রুটি: {process.stderr[:500]}...")
 
-# বট শুরু করা হচ্ছে
+
 if __name__ == "__main__":
     print("Bot is starting...")
     bot.run()
