@@ -12,6 +12,7 @@ from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+from a2wsgi import ASGIMiddleware # <<<<<<<< নতুন ইম্পোর্ট >>>>>>>>
 
 # --- প্রাথমিক সেটআপ ---
 load_dotenv()
@@ -29,6 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- ডেটাবেস ফাংশন (SQLite) ---
+# (এই অংশ অপরিবর্তিত)
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -195,14 +197,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
 
-# <<<<<<<<<<<<<<<< মূল পরিবর্তন এখানে >>>>>>>>>>>>>>>>>>
-# আমরা এখন Application object টি একটি async main ফাংশনের ভেতরে তৈরি করছি
 async def main():
     """বটটি initialize এবং run করার জন্য একটি async main function"""
-    # ContextTypes আর প্রয়োজন নেই
-    application = (
-        Application.builder().token(TELEGRAM_TOKEN).build()
-    )
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # হ্যান্ডলার যোগ করা
     application.add_handler(CommandHandler("start", start_command))
@@ -210,27 +207,27 @@ async def main():
     application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # বট initialize করা
     await application.initialize()
-    
-    # ওয়েবহুক সেট করা
     await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
     
     # Flask অ্যাপ তৈরি করা
-    app = Flask(__name__)
+    flask_app = Flask(__name__)
 
-    @app.route("/")
+    @flask_app.route("/")
     def index():
         return "Bot is alive and running!"
 
-    @app.route("/webhook", methods=["POST"])
+    @flask_app.route("/webhook", methods=["POST"])
     async def webhook_handler():
         await application.update_queue.put(
             Update.de_json(request.get_json(force=True), application.bot)
         )
         return "ok"
+    
+    # <<<<<<<< মূল পরিবর্তন এখানে >>>>>>>>
+    # Flask অ্যাপটিকে একটি ASGI অ্যাপে রূপান্তর করা হচ্ছে
+    asgi_app = ASGIMiddleware(flask_app)
 
-    # Gunicorn worker-এর জন্য uvicorn ব্যবহার করে Flask অ্যাপ চালানো
     import uvicorn
     
     host = os.getenv("HOST", "0.0.0.0")
@@ -238,7 +235,7 @@ async def main():
 
     web_server = uvicorn.Server(
         config=uvicorn.Config(
-            app=app,
+            app=asgi_app,
             host=host,
             port=port,
             log_level="info",
