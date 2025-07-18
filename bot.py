@@ -12,91 +12,94 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
+# --- প্রাথমিক সেটআপ ---
 load_dotenv()
 
-# --- Configuration ---
+# --- কনফিগারেশন ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 DB_NAME = 'bot_data.db' # ডেটাবেস ফাইলের নাম
 
-# --- Logging Setup ---
+# --- লগিং সেটআপ ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Database Setup (SQLite) ---
+# --- ডেটাবেস ফাংশন (SQLite) ---
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    # ব্যবহারকারীর তথ্য রাখার জন্য একটি টেবিল তৈরি করা
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            state TEXT,
-            data TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-    logger.info("SQLite database initialized.")
+    """ডেটাবেস এবং টেবিল তৈরি করে"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                state TEXT,
+                data TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("SQLite database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
 
-# --- Database Helper Functions (Using SQLite) ---
 def set_user_data(user_id, state=None, data=None):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # প্রথমে ব্যবহারকারীর সব ডেটা পড়া
-    cursor.execute("SELECT data FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    current_data = json.loads(row[0]) if row and row[0] else {}
-
-    # নতুন ডেটা আপডেট করা
-    if data:
-        current_data.update(data)
-    
-    # ডেটাবেসে আবার সেভ করা
-    if state is not None:
+    """ব্যবহারকারীর ডেটা সেভ বা আপডেট করে"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT data FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        current_data = json.loads(row[0]) if row and row[0] else {}
+        if data:
+            current_data.update(data)
+        
         cursor.execute("INSERT OR REPLACE INTO users (user_id, state, data) VALUES (?, ?, ?)", 
-                       (user_id, state, json.dumps(current_data)))
-    else:
-        # যদি শুধু ডেটা আপডেট হয় কিন্তু স্টেট না
-        cursor.execute("UPDATE users SET data = ? WHERE user_id = ?", (json.dumps(current_data), user_id))
-
-    conn.commit()
-    conn.close()
+                       (user_id, state if state is not None else (get_user_data(user_id).get('state')), json.dumps(current_data)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to set user data for {user_id}: {e}")
 
 def get_user_data(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT state, data FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        state, data_str = row
-        user_data = json.loads(data_str) if data_str else {}
-        user_data['state'] = state
-        return user_data
+    """ব্যবহারকারীর ডেটা নিয়ে আসে"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT state, data FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            state, data_str = row
+            user_data = json.loads(data_str) if data_str else {}
+            user_data['state'] = state
+            return user_data
+    except Exception as e:
+        logger.error(f"Failed to get user data for {user_id}: {e}")
     return {}
 
 def delete_user_data(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    """ব্যবহারকারীর ডেটা মুছে ফেলে"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to delete user data for {user_id}: {e}")
 
-# --- User States ---
+# --- ব্যবহারকারীর অবস্থা ---
 STATE_AWAITING_MOVIE = 'awaiting_movie'
 STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 
-# --- Video Processing and Other Functions (কোনো পরিবর্তন নেই) ---
-# ... (আগের কোডের বাকি অংশ এখানে হুবহু একই থাকবে)
-# ... (আমি পুরোটা আবার পেস্ট করছি কনফিউশন এড়ানোর জন্য)
-
+# --- মূল ভিডিও প্রসেসিং ফাংশন ---
 def process_video(user_id, chat_id, context):
+    # এই ফাংশনটি আগের মতোই থাকবে, কোনো পরিবর্তন নেই
     bot = context.bot
     temp_dir = f"temp_{user_id}"
     try:
@@ -154,6 +157,7 @@ def process_video(user_id, chat_id, context):
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
+# --- টেলিগ্রাম হ্যান্ডলার ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     set_user_data(user.id, state=STATE_AWAITING_MOVIE, data={})
@@ -188,22 +192,48 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             threading.Thread(target=process_video, args=(user_id, chat_id, context)).start()
         else: await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
 
-# --- Flask Web App and Bot Setup ---
-init_db() # অ্যাপ শুরু হওয়ার সময় ডেটাবেস ফাইল তৈরি করা
+# --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
+init_db()  # অ্যাপ শুরু হওয়ার সময় ডেটাবেস ফাইল তৈরি করা
 
-app = Flask(__name__)
+app = Flask(__name__) # Flask অ্যাপ ইনিশিয়ালাইজ করা
+
+@app.route('/')
+def index():
+    """মূল URL-এ একটি মেসেজ দেখানোর জন্য, যা প্রমাণ করে বটটি চলছে"""
+    return "Bot is alive and running!"
+
+# টেলিগ্রাম বট অ্যাপ্লিকেশন তৈরি করা
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start_command))
 bot_app.add_handler(CommandHandler("cancel", cancel_command))
 bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
 async def setup_webhook():
-    if WEBHOOK_URL: await bot_app.bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"Webhook has been set to {WEBHOOK_URL}")
-asyncio.run(setup_webhook())
+    """ওয়েবহুক সেট করার জন্য একটি অ্যাসিঙ্ক্রোনাস ফাংশন"""
+    if WEBHOOK_URL:
+        await bot_app.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Webhook has been set to {WEBHOOK_URL}")
+    else:
+        logger.warning("WEBHOOK_URL not set. Skipping webhook setup.")
+
+# Gunicorn সার্ভার শুরু হওয়ার সাথে সাথে ওয়েবহুক সেট করা
+try:
+    asyncio.run(setup_webhook())
+except RuntimeError:
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(setup_webhook())
+    else:
+        loop.run_until_complete(setup_webhook())
+
 
 @app.route('/webhook', methods=['POST'])
 async def webhook():
-    update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    await bot_app.process_update(update)
+    """টেলিগ্রাম থেকে আসা সব আপডেট এখানে হ্যান্ডেল করা হবে"""
+    try:
+        update_data = request.get_json(force=True)
+        update = Update.de_json(update_data, bot_app.bot)
+        await bot_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}")
     return 'ok', 200
