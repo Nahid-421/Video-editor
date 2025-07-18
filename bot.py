@@ -2,6 +2,8 @@ import os
 import logging
 import subprocess
 import threading
+import shutil
+import asyncio
 
 from flask import Flask, request
 from telegram import Update
@@ -9,43 +11,43 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
-# .env ফাইল থেকে এনভায়রনমেন্ট ভেরিয়েবল লোড করা (লোকালে টেস্টের জন্য)
 load_dotenv()
 
-# --- কনফিগারেশন ---
-# এই মানগুলো Render-এর Environment Variables থেকে আসবে
+# --- Configuration ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # যেমন: https://your-bot-name.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# লগিং সেটআপ
+# --- Logging Setup ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- ডেটাবেস এবং স্টেট ম্যানেজমেন্ট ---
+# --- Database Connection ---
 try:
+    if not MONGO_URI or not (MONGO_URI.startswith("mongodb://") or MONGO_URI.startswith("mongodb+srv://")):
+        raise ValueError("Invalid or missing MONGO_URI. Please check your environment variables.")
     client = MongoClient(MONGO_URI)
-    db = client.get_default_database() # কানেকশন স্ট্রিং থেকে ডেটাবেস নাম নেয়
+    db = client.get_default_database()
     users_collection = db['users']
     logger.info("MongoDB successfully connected.")
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
-    client = None # কানেকশন ব্যর্থ হলে ক্লায়েন্টকে None করে দিন
+    client = None
 
-# ব্যবহারকারীর বিভিন্ন অবস্থা (States)
+# --- User States ---
 STATE_AWAITING_MOVIE = 'awaiting_movie'
 STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 
-# --- Helper Functions for Database ---
+# --- Database Helper Functions ---
 def set_user_data(user_id, state=None, data=None):
     if not client: return
     query = {'user_id': user_id}
     update = {'$set': {}}
-    if state:
+    if state is not None:
         update['$set']['state'] = state
     if data:
         for key, value in data.items():
@@ -58,11 +60,10 @@ def get_user_data(user_id):
     if not client: return {}
     return users_collection.find_one({'user_id': user_id}) or {}
 
-# --- ভিডিও প্রসেসিং ফাংশন (আলাদা থ্রেডে চলবে) ---
+# --- Video Processing Function ---
 def process_video(user_id, chat_id, context):
     bot = context.bot
     temp_dir = f"temp_{user_id}"
-    
     try:
         user_data = get_user_data(user_id)
         movie_file_id = user_data.get('movie_file_id')
@@ -70,11 +71,10 @@ def process_video(user_id, chat_id, context):
         ad_count = user_data.get('ad_count')
 
         if not all([movie_file_id, ad_file_id, ad_count]):
-            raise ValueError("প্রয়োজনীয় তথ্য ডেটাবেসে পাওয়া যায়নি।")
+            raise ValueError("Required data not found in the database.")
 
-        # ১. অস্থায়ী ফোল্ডার তৈরি ও ফাইল ডাউনলোড
         os.makedirs(temp_dir, exist_ok=True)
-        bot.send_message(chat_id, "ফাইল ডাউনলোড শুরু হচ্ছে... 📥")
+        bot.send_message(chat_id, "Downloading files... 📥")
         
         movie_path = os.path.join(temp_dir, 'movie.mp4')
         (bot.get_file(movie_file_id)).download_to_drive(movie_path)
@@ -82,14 +82,12 @@ def process_video(user_id, chat_id, context):
         ad_path = os.path.join(temp_dir, 'ad.mp4')
         (bot.get_file(ad_file_id)).download_to_drive(ad_path)
         
-        bot.send_message(chat_id, "ডাউনলোড সম্পন্ন। ভিডিও প্রসেসিং শুরু হচ্ছে... ⚙️")
+        bot.send_message(chat_id, "Download complete. Processing video... ⚙️")
 
-        # ২. মুভির মোট দৈর্ঘ্য বের করা
         ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', movie_path]
-        result = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         duration = float(result.stdout)
 
-        # ৩. মুভিকে সমান অংশে ভাগ করে বিজ্ঞাপনের সাথে জোড়া লাগানোর জন্য লিস্ট তৈরি
         num_splits = ad_count + 1
         split_duration = duration / num_splits
         
@@ -101,43 +99,39 @@ def process_video(user_id, chat_id, context):
                 f.write(f"outpoint {(i * split_duration) + split_duration}\n")
                 f.write(f"file '{os.path.basename(ad_path)}'\n")
             
-            # শেষ অংশ যোগ করা
             f.write(f"file '{os.path.basename(movie_path)}'\n")
             f.write(f"inpoint {ad_count * split_duration}\n")
 
-        # ৪. FFmpeg দিয়ে ফাইলগুলোকে জোড়া লাগানো
         output_path = os.path.join(temp_dir, 'final_movie.mp4')
-        bot.send_message(chat_id, "ফাইলগুলো জোড়া লাগানো হচ্ছে... এটি সবচেয়ে সময়সাপেক্ষ ধাপ। অনুগ্রহ করে ধৈর্য ধরুন।")
+        bot.send_message(chat_id, "Merging files... This is the longest step. Please be patient.")
         
-        ffmpeg_cmd = ['ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', output_path]
+        ffmpeg_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', output_path]
         subprocess.run(ffmpeg_cmd, check=True)
 
-        # ৫. ফাইনাল ফাইল পাঠানো
-        bot.send_message(chat_id, "প্রসেসিং সম্পন্ন! ✅\nফাইলটি আপলোড করা হচ্ছে...")
+        bot.send_message(chat_id, "Processing complete! ✅\nUploading the file...")
         with open(output_path, 'rb') as final_video:
-            bot.send_video(chat_id, video=final_video, caption="আপনার এডিট করা মুভি।", read_timeout=120, write_timeout=120)
+            bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120)
 
     except Exception as e:
         logger.error(f"Error processing for user {user_id}: {e}", exc_info=True)
-        bot.send_message(chat_id, f"একটি গুরুতর সমস্যা হয়েছে। সম্ভবত ফাইলটি অনেক বড় অথবা সার্ভার এটি প্রসেস করতে পারেনি।\n\nError: {e}\n\nআবার চেষ্টা করতে /start চাপুন।")
+        bot.send_message(chat_id, f"A critical error occurred. The file might be too large or the server could not process it.\n\nError: {e}\n\nPress /start to try again.")
     finally:
-        # ৬. ব্যবহারকারীর স্টেট রিসেট করা ও অস্থায়ী ফাইল ডিলিট করা
         set_user_data(user_id, state=None, data={'movie_file_id': None, 'ad_file_id': None, 'ad_count': None})
         if os.path.exists(temp_dir):
-            import shutil
             shutil.rmtree(temp_dir)
 
-# --- Telegram Command and Message Handlers ---
+# --- Telegram Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     set_user_data(user.id, state=STATE_AWAITING_MOVIE)
-    await update.message.reply_html(f"👋 হ্যালো {user.mention_html()}!\n\nআমি আপনার মুভিতে বিজ্ঞাপন যুক্ত করতে পারি।\n\nপ্রথমে আমাকে আপনার **মূল মুভি ফাইলটি** পাঠান।")
+    await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nI can add ads to your movies.\n\nFirst, send me the main **movie file**.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_user_data(update.effective_user.id, state=None)
-    await update.message.reply_text("প্রক্রিয়া বাতিল করা হয়েছে। নতুন করে শুরু করতে /start চাপুন।")
+    await update.message.reply_text("Process cancelled. Press /start to begin again.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message: return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_data = get_user_data(user_id)
@@ -146,52 +140,46 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == STATE_AWAITING_MOVIE:
         if update.message.video:
             set_user_data(user_id, state=STATE_AWAITING_AD, data={'movie_file_id': update.message.video.file_id})
-            await update.message.reply_text("মুভি পেয়েছি। ✅\n\nএবার **বিজ্ঞাপনের ভিডিও ফাইলটি** পাঠান।")
+            await update.message.reply_text("Movie received. ✅\n\nNow, send me the **advertisement video**.")
         else:
-            await update.message.reply_text("❌ ভুল ইনপুট। দয়া করে একটি **ভিডিও ফাইল** পাঠান।")
+            await update.message.reply_text("❌ Invalid input. Please send a **video file**.")
 
     elif state == STATE_AWAITING_AD:
         if update.message.video:
             set_user_data(user_id, state=STATE_AWAITING_AD_COUNT, data={'ad_file_id': update.message.video.file_id})
-            await update.message.reply_text("বিজ্ঞাপন পেয়েছি। ✅\n\nএখন বলুন, মুভির মধ্যে মোট **কতবার** বিজ্ঞাপনটি বসাতে চান? (শুধুমাত্র একটি সংখ্যা লিখুন, যেমন: 2 বা 3)")
+            await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (Send only a number, e.g., 2 or 3)")
         else:
-            await update.message.reply_text("❌ ভুল ইনপুট। দয়া করে একটি **বিজ্ঞাপনের ভিডিও ফাইল** পাঠান।")
+            await update.message.reply_text("❌ Invalid input. Please send an **advertisement video file**.")
 
     elif state == STATE_AWAITING_AD_COUNT:
         if update.message.text and update.message.text.isdigit() and int(update.message.text) > 0:
             count = int(update.message.text)
             set_user_data(user_id, state='processing', data={'ad_count': count})
-            await update.message.reply_text(f"তথ্য গ্রহণ সম্পন্ন। আপনার মুভিতে {count} বার বিজ্ঞাপন যুক্ত করার কাজ শুরু হচ্ছে। এটি শেষ হতে কয়েক মিনিট থেকে শুরু করে এক ঘণ্টা বা তার বেশিও সময় লাগতে পারে। কাজ শেষ হলে আমি আপনাকে ফাইলটি পাঠিয়ে দেব।")
+            await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times. This may take from a few minutes to over an hour. I will send you the file when it's done.")
             
-            # মূল প্রসেসিং ফাংশনকে একটি আলাদা থ্রেডে চালানো হচ্ছে
             threading.Thread(target=process_video, args=(user_id, chat_id, context)).start()
         else:
-            await update.message.reply_text("❌ ভুল ইনপুট। দয়া করে 0-এর চেয়ে বড় একটি **সংখ্যা** লিখুন (যেমন: 1, 2, 3)।")
+            await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0** (e.g., 1, 2, 3).")
 
-# --- Flask Web App for Webhook ---
+# --- Flask Web App and Bot Setup ---
 app = Flask(__name__)
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+bot_app.add_handler(CommandHandler("start", start_command))
+bot_app.add_handler(CommandHandler("cancel", cancel_command))
+bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
+
+async def setup_webhook():
+    if WEBHOOK_URL:
+        await bot_app.bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook has been set to {WEBHOOK_URL}")
+    else:
+        logger.warning("WEBHOOK_URL not set. Skipping webhook setup.")
+
+asyncio.run(setup_webhook())
+
 @app.route('/webhook', methods=['POST'])
-def webhook():
+async def webhook():
     update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    bot_app.update_queue.put(update)
-    return 'ok'
-
-def main():
-    # Register handlers
-    bot_app.add_handler(CommandHandler("start", start_command))
-    bot_app.add_handler(CommandHandler("cancel", cancel_command))
-    bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
-    
-    # Set webhook
-    bot_app.bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"Webhook has been set to {WEBHOOK_URL}")
-
-if __name__ == "__main__":
-    main()
-    # Gunicorn এই অ্যাপটি চালাবে, তাই নিচের app.run() প্রোডাকশনে ব্যবহৃত হবে না।
-    # For local testing, you might run this file directly.
-    # HOST = '0.0.0.0'
-    # PORT = 8080
-    # app.run(host=HOST, port=PORT)
+    await bot_app.process_update(update)
+    return 'ok', 200
