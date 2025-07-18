@@ -1,5 +1,6 @@
-python-telegram-bot
+python-telegram-bot==21.0.1
 flask
 pymongo
 python-dotenv
 gunicorn
+asyncio
