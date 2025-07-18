@@ -8,13 +8,9 @@ import sqlite3
 import json
 import time as a_time
 
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import PlainTextResponse
-from starlette.routing import Route
+from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import uvicorn
 
 # --- কনফিগারেশন ---
 TELEGRAM_TOKEN = "7849157640:AAFyGM8F-Yk7tqH2A_vOfVGqMx6bXPq-pTI"
@@ -94,8 +90,8 @@ def process_video_thread(user_id, chat_id, token, progress_message_id):
         movie_file_id, ad_file_id, ad_count = user_data.get('movie_file_id'), user_data.get('ad_file_id'), user_data.get('ad_count')
         if not all([movie_file_id, ad_file_id, ad_count]): raise ValueError("Required data missing.")
         os.makedirs(temp_dir, exist_ok=True)
-        movie_path, ad_path = os.path.join(temp_dir, 'movie.mp4'), os.path.join(temp_dir, 'ad.mp4')
         
+        movie_path, ad_path = os.path.join(temp_dir, 'movie.mp4'), os.path.join(temp_dir, 'ad.mp4')
         run_async(bot.edit_message_text("Downloading files...", chat_id=chat_id, message_id=progress_message_id))
         run_async(bot.get_file(movie_file_id).download_to_drive(movie_path))
         run_async(bot.get_file(ad_file_id).download_to_drive(ad_path))
@@ -103,7 +99,7 @@ def process_video_thread(user_id, chat_id, token, progress_message_id):
         ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', movie_path]
         result = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         total_duration = float(result.stdout)
-        num_splits, split_duration = ad_count + 1, total_duration / (ad_count + 1)
+        split_duration = total_duration / (ad_count + 1)
         
         concat_list_path = os.path.join(temp_dir, 'concat_list.txt')
         with open(concat_list_path, 'w') as f:
@@ -169,33 +165,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state == STATE_PROCESSING: await update.message.reply_text("Processing your video. Please wait.")
     else: await update.message.reply_text("Not expecting text now. /start to begin.")
 
-# --- ওয়েব অ্যাপ্লিকেশন এবং বট চালু করা ---
+# --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
 ptb_app = Application.builder().token(TELEGRAM_TOKEN).build()
+ptb_app.add_handler(CommandHandler("start", start_command))
+ptb_app.add_handler(CommandHandler("cancel", cancel_command))
+ptb_app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
+ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-async def index(request: Request):
-    return PlainTextResponse("Bot is alive and running!")
+app = Flask(__name__) # Gunicorn এই 'app' ভেরিয়েবলটি খুঁজবে
 
-async def webhook_handler(request: Request):
-    await ptb_app.update_queue.put(Update.de_json(await request.json(), ptb_app.bot))
-    return PlainTextResponse("ok")
+@app.route('/')
+def index():
+    return "Bot is alive and running!"
 
-async def startup():
-    ptb_app.add_handler(CommandHandler("start", start_command))
-    ptb_app.add_handler(CommandHandler("cancel", cancel_command))
-    ptb_app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
-    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    try:
+        await ptb_app.update_queue.put(Update.de_json(request.get_json(force=True), ptb_app.bot))
+    except Exception as e:
+        logger.error(f"Error in webhook: {e}", exc_info=True)
+    return 'ok'
+
+async def bot_setup():
     await ptb_app.initialize()
-    await ptb_app.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+    await ptb_app.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     logger.info("Bot started and webhook is set.")
 
-async def shutdown():
-    logger.info("Bot is shutting down.")
-    await ptb_app.shutdown()
-
-routes = [
-    Route("/", endpoint=index, methods=["GET"]),
-    Route("/webhook", endpoint=webhook_handler, methods=["POST"]),
-]
-
-app = Starlette(routes=routes, on_startup=[startup], on_shutdown=[shutdown])
+# Gunicorn সার্ভার শুরু হওয়ার সাথে সাথে ওয়েবহুক সেট করা
+asyncio.run(bot_setup())
