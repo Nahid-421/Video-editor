@@ -17,7 +17,7 @@ load_dotenv()
 
 # --- কনফিগারেশন ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DB_NAME = 'bot_data.db' # ডেটাবেস ফাইলের নাম
+DB_NAME = 'bot_data.db'
 
 # --- লগিং সেটআপ ---
 logging.basicConfig(
@@ -201,7 +201,6 @@ bot_app.add_handler(CommandHandler("cancel", cancel_command))
 bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
 async def setup_webhook():
-    # <<<<<<<< আপনার URLটি এখানে সরাসরি বসিয়ে দেওয়া হয়েছে >>>>>>>>
     final_webhook_url = "https://video-editor-4v54.onrender.com/webhook"
     
     try:
@@ -210,7 +209,6 @@ async def setup_webhook():
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
 
-# Gunicorn সার্ভার শুরু হওয়ার সাথে সাথে ওয়েবহুক সেট করা
 try:
     asyncio.run(setup_webhook())
 except RuntimeError:
