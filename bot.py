@@ -6,6 +6,8 @@ import shutil
 import asyncio
 import sqlite3
 import json
+import re
+import time as a_time
 
 from flask import Flask, request
 from telegram import Update
@@ -28,6 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- ডেটাবেস ফাংশন (SQLite) ---
+# (এই অংশ অপরিবর্তিত)
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -97,20 +100,26 @@ STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 STATE_PROCESSING = 'processing'
 
-# --- মূল ভিডিও প্রসেসিং ফাংশন ---
+# --- মূল ভিডিও প্রসেসিং ফাংশন (প্রোগ্রেস বার সহ) ---
 def process_video(user_id, chat_id, context):
     bot = context.bot
     temp_dir = f"temp_{user_id}"
+    progress_message = None
 
     # <<<<<<< এই অংশটিই সব সমস্যার সমাধান >>>>>>>
-    # থ্রেডের ভেতর থেকে মেসেজ পাঠানোর জন্য একটি নিরাপদ ফাংশন
-    def send_sync_message(text):
+    def run_async_from_thread(coro):
+        """থ্রেডের ভেতর থেকে একটি async ফাংশন নিরাপদে চালানোর জন্য"""
         try:
-            # প্রতিটি মেসেজের জন্য একটি নতুন asyncio loop তৈরি করা হচ্ছে
-            asyncio.run(bot.send_message(chat_id=chat_id, text=text))
-        except Exception as e:
-            logger.error(f"Error sending sync message in thread: {e}")
-
+            return asyncio.run(coro)
+        except RuntimeError as e:
+            # যদি একটি লুপ আগে থেকেই চলতে থাকে
+            if "cannot run loop while another loop is running" in str(e):
+                # এটি একটি workaround, তবে এই ক্ষেত্রে কাজ করবে
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(coro)
+            raise e
+            
     try:
         user_data = get_user_data(user_id).get('data', {})
         movie_file_id = user_data.get('movie_file_id')
@@ -121,21 +130,21 @@ def process_video(user_id, chat_id, context):
             raise ValueError("Required data not found for processing.")
 
         os.makedirs(temp_dir, exist_ok=True)
-        send_sync_message("Downloading files... 📥 This may take a while.")
+        progress_message = run_async_from_thread(bot.send_message(chat_id, "Downloading files... 📥"))
         
         movie_path = os.path.join(temp_dir, 'movie.mp4')
-        asyncio.run(bot.get_file(movie_file_id).download_to_drive(movie_path))
+        run_async_from_thread(bot.get_file(movie_file_id).download_to_drive(movie_path))
         ad_path = os.path.join(temp_dir, 'ad.mp4')
-        asyncio.run(bot.get_file(ad_file_id).download_to_drive(ad_path))
+        run_async_from_thread(bot.get_file(ad_file_id).download_to_drive(ad_path))
         
-        send_sync_message("Download complete. Processing video... ⚙️ This is the longest step.")
+        run_async_from_thread(bot.edit_message_text("Download complete. Processing video... ⚙️", chat_id=chat_id, message_id=progress_message.message_id))
 
         ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', movie_path]
         result = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        duration = float(result.stdout)
+        total_duration = float(result.stdout)
 
         num_splits = ad_count + 1
-        split_duration = duration / num_splits
+        split_duration = total_duration / num_splits
         
         concat_list_path = os.path.join(temp_dir, 'concat_list.txt')
         with open(concat_list_path, 'w') as f:
@@ -144,23 +153,43 @@ def process_video(user_id, chat_id, context):
                 f.write(f"inpoint {i * split_duration}\n")
                 f.write(f"outpoint {(i * split_duration) + split_duration}\n")
                 f.write(f"file '{os.path.basename(ad_path)}'\n")
-            
             f.write(f"file '{os.path.basename(movie_path)}'\n")
             f.write(f"inpoint {ad_count * split_duration}\n")
 
         output_path = os.path.join(temp_dir, 'final_movie.mp4')
-        send_sync_message("Merging files... Please be patient.")
         
-        ffmpeg_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', output_path]
-        subprocess.run(ffmpeg_cmd, check=True)
+        # <<<<<<< রিয়েল-টাইম প্রোগ্রেস দেখানোর জন্য FFmpeg কমান্ড >>>>>>>
+        ffmpeg_cmd = ['ffmpeg', '-y', '-progress', '-', '-nostats', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', output_path]
+        
+        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding="utf-8")
+        
+        last_update_time = a_time.time()
+        for line in process.stdout:
+            if "out_time_ms" in line:
+                current_time_ms = int(line.strip().split("=")[1])
+                current_time_s = current_time_ms / 1_000_000
+                percentage = int((current_time_s / total_duration) * 100)
+                
+                # প্রতি ৫ সেকেন্ডে বা ৫% পর পর মেসেজ এডিট করা
+                if a_time.time() - last_update_time > 5:
+                    try:
+                        run_async_from_thread(bot.edit_message_text(f"Processing... {percentage}% complete ⚙️", chat_id=chat_id, message_id=progress_message.message_id))
+                        last_update_time = a_time.time()
+                    except Exception as e:
+                        logger.warning(f"Could not edit message: {e}")
+        
+        process.wait() # FFmpeg শেষ হওয়ার জন্য অপেক্ষা করা
 
-        send_sync_message("Processing complete! ✅\nUploading the file...")
+        run_async_from_thread(bot.edit_message_text("Processing complete! ✅\nUploading the file...", chat_id=chat_id, message_id=progress_message.message_id))
         with open(output_path, 'rb') as final_video:
-            asyncio.run(bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120))
+            run_async_from_thread(bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120))
 
     except Exception as e:
         logger.error(f"Error in process_video thread for user {user_id}:", exc_info=True)
-        send_sync_message("A critical error occurred during processing. Please try again by sending /start.")
+        if progress_message:
+            run_async_from_thread(bot.edit_message_text("A critical error occurred. Please try again with /start.", chat_id=chat_id, message_id=progress_message.message_id))
+        else:
+            run_async_from_thread(bot.send_message(chat_id, "A critical error occurred. Please try again with /start."))
     finally:
         delete_user_data(user_id)
         if os.path.exists(temp_dir):
@@ -178,8 +207,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    state = user_data.get('state')
+    state = get_user_data(user_id).get('state')
 
     if state == STATE_AWAITING_MOVIE:
         set_user_data(user_id, state=STATE_AWAITING_AD, data_to_add={'movie_file_id': update.message.video.file_id})
@@ -188,12 +216,11 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         set_user_data(user_id, state=STATE_AWAITING_AD_COUNT, data_to_add={'ad_file_id': update.message.video.file_id})
         await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (e.g., 2)")
     else:
-        await update.message.reply_text("I was not expecting a video. Please follow the instructions or start over with /start.")
+        await update.message.reply_text("I was not expecting a video. Please start over with /start.")
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    state = user_data.get('state')
+    state = get_user_data(user_id).get('state')
 
     if state == STATE_AWAITING_AD_COUNT:
         if update.message.text and update.message.text.isdigit() and int(update.message.text) > 0:
