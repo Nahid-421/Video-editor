@@ -1,6 +1,5 @@
 python-telegram-bot==21.0.1
-flask
-redis
-python-dotenv
+flask[async]
 gunicorn
+python-dotenv
 asyncio
