@@ -27,9 +27,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- ডেটাবেস ফাংশন (SQLite) ---
+# (এই অংশ অপরিবর্তিত)
 def init_db():
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -46,7 +47,7 @@ def init_db():
 
 def set_user_data(user_id, state=None, data=None):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("SELECT data FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
@@ -59,11 +60,11 @@ def set_user_data(user_id, state=None, data=None):
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Failed to set user data for {user_id}: {e}")
+        logger.error(f"Failed to set user data for {user_id}: {e}", exc_info=True)
 
 def get_user_data(user_id):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("SELECT state, data FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
@@ -74,18 +75,18 @@ def get_user_data(user_id):
             user_data['state'] = state
             return user_data
     except Exception as e:
-        logger.error(f"Failed to get user data for {user_id}: {e}")
+        logger.error(f"Failed to get user data for {user_id}: {e}", exc_info=True)
     return {}
 
 def delete_user_data(user_id):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Failed to delete user data for {user_id}: {e}")
+        logger.error(f"Failed to delete user data for {user_id}: {e}", exc_info=True)
 
 # --- ব্যবহারকারীর অবস্থা ---
 STATE_AWAITING_MOVIE = 'awaiting_movie'
@@ -93,6 +94,7 @@ STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 
 # --- মূল ভিডিও প্রসেসিং ফাংশন ---
+# (এই অংশ অপরিবর্তিত)
 def process_video(user_id, chat_id, context):
     bot = context.bot
     temp_dir = f"temp_{user_id}"
@@ -144,7 +146,7 @@ def process_video(user_id, chat_id, context):
             bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120)
 
     except Exception as e:
-        logger.error(f"Error processing for user {user_id}: {e}", exc_info=True)
+        logger.error(f"Error in process_video thread for user {user_id}:", exc_info=True)
         bot.send_message(chat_id, f"A critical error occurred. Press /start to try again.")
     finally:
         delete_user_data(user_id)
@@ -152,6 +154,7 @@ def process_video(user_id, chat_id, context):
             shutil.rmtree(temp_dir)
 
 # --- টেলিগ্রাম হ্যান্ডলার ---
+# (এই অংশ অপরিবর্তিত)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     set_user_data(user.id, state=STATE_AWAITING_MOVIE, data={})
@@ -186,44 +189,38 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             threading.Thread(target=process_video, args=(user_id, chat_id, context)).start()
         else: await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
 
+
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
 
+# Application object টি এখন এখানে তৈরি করা হচ্ছে
+bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+bot_app.add_handler(CommandHandler("start", start_command))
+bot_app.add_handler(CommandHandler("cancel", cancel_command))
+bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
+
+# Flask অ্যাপ
 app = Flask(__name__)
 
 @app.route('/')
 def index():
     return "Bot is alive and running!"
 
-bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
-bot_app.add_handler(CommandHandler("start", start_command))
-bot_app.add_handler(CommandHandler("cancel", cancel_command))
-bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
-
-async def setup_webhook():
-    final_webhook_url = "https://video-editor-4v54.onrender.com/webhook"
-    
-    try:
-        await bot_app.bot.set_webhook(url=final_webhook_url, allowed_updates=Update.ALL_TYPES)
-        logger.info(f"Webhook has been forcefully set to {final_webhook_url}")
-    except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
-
-try:
-    asyncio.run(setup_webhook())
-except RuntimeError:
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        loop.create_task(setup_webhook())
-    else:
-        loop.run_until_complete(setup_webhook())
-
 @app.route('/webhook', methods=['POST'])
 async def webhook():
+    logger.info("--- Webhook triggered ---")
     try:
         update_data = request.get_json(force=True)
+        logger.info(f"Received data: {update_data}") # আমরা এখন দেখতে পাব টেলিগ্রাম কী পাঠাচ্ছে
+        
         update = Update.de_json(update_data, bot_app.bot)
+        logger.info("Update object created successfully. Processing update...")
+        
         await bot_app.process_update(update)
+        
+        logger.info("--- Update processed successfully ---")
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
+        logger.error("!!! CRITICAL ERROR IN WEBHOOK !!!", exc_info=True)
     return 'ok', 200
+
+# অ্যাসিঙ্ক্রোনাস ফাংশন এখন আর সরাসরি চালানো হচ্ছে না, কারণ Gunicorn এটি হ্যান্ডেল করবে
