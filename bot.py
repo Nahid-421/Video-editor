@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 # --- প্রাথমিক সেটআপ ---
 load_dotenv()
 
-# --- কনফিগারেশন (আপনার তথ্য সরাসরি বসানো হয়েছে) ---
+# --- কনফিগারেশন ---
 TELEGRAM_TOKEN = "7849157640:AAFyGM8F-Yk7tqH2A_vOfVGqMx6bXPq-pTI"
 WEBHOOK_URL = "https://video-editor-4v54.onrender.com/webhook"
 DB_NAME = 'bot_data.db'
@@ -27,15 +27,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- ডেটাবেস ফাংশন (SQLite - নির্ভরযোগ্য এবং থ্রেড-সেফ) ---
+# --- ডেটাবেস ফাংশন (SQLite) ---
 def get_db_connection():
-    """ডেটাবেসের সাথে একটি নতুন থ্রেড-সেফ কানেকশন তৈরি করে"""
     conn = sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """অ্যাপ্লিকেশন শুরু হওয়ার সময় ডেটাবেস এবং টেবিল তৈরি করে"""
     try:
         conn = get_db_connection()
         conn.execute('''
@@ -52,14 +50,11 @@ def init_db():
         logger.error(f"Failed to initialize database: {e}", exc_info=True)
 
 def set_user_data(user_id, state=None, data_to_add=None):
-    """ব্যবহারকারীর ডেটা সেভ বা আপডেট করে"""
     try:
         current_data = get_user_data(user_id).get('data', {})
         if data_to_add:
             current_data.update(data_to_add)
-
         current_state = state if state is not None else get_user_data(user_id).get('state')
-        
         conn = get_db_connection()
         conn.execute(
             "INSERT OR REPLACE INTO users (user_id, state, data) VALUES (?, ?, ?)",
@@ -71,9 +66,7 @@ def set_user_data(user_id, state=None, data_to_add=None):
     except Exception as e:
         logger.error(f"Failed to set user data for {user_id}: {e}", exc_info=True)
 
-
 def get_user_data(user_id):
-    """ব্যবহারকারীর ডেটা নিয়ে আসে"""
     try:
         conn = get_db_connection()
         user_row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -89,7 +82,6 @@ def get_user_data(user_id):
     return {}
 
 def delete_user_data(user_id):
-    """প্রসেস শেষে ব্যবহারকারীর ডেটা মুছে ফেলে"""
     try:
         conn = get_db_connection()
         conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
@@ -176,51 +168,55 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delete_user_data(user_id)
     await update.message.reply_text("Process cancelled. You can start a new one by sending /start.")
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
+async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """শুধুমাত্র ভিডিও মেসেজ হ্যান্ডেল করার জন্য"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     state = user_data.get('state')
     
-    logger.info(f"Message received from user {user_id}. Current state: {state}")
+    logger.info(f"VIDEO message received from user {user_id}. Current state: {state}")
 
     if state == STATE_AWAITING_MOVIE:
-        if update.message.video:
-            set_user_data(user_id, state=STATE_AWAITING_AD, data_to_add={'movie_file_id': update.message.video.file_id})
-            await update.message.reply_text("Movie received. ✅\n\nNow, send me the **advertisement video**.")
-        else:
-            await update.message.reply_text("I'm waiting for a movie file. Please send a video to start.")
-            
+        set_user_data(user_id, state=STATE_AWAITING_AD, data_to_add={'movie_file_id': update.message.video.file_id})
+        await update.message.reply_text("Movie received. ✅\n\nNow, send me the **advertisement video**.")
     elif state == STATE_AWAITING_AD:
-        if update.message.video:
-            set_user_data(user_id, state=STATE_AWAITING_AD_COUNT, data_to_add={'ad_file_id': update.message.video.file_id})
-            await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (e.g., 2)")
-        else:
-            await update.message.reply_text("I'm waiting for an ad file. Please send an **advertisement video file**.")
+        set_user_data(user_id, state=STATE_AWAITING_AD_COUNT, data_to_add={'ad_file_id': update.message.video.file_id})
+        await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (e.g., 2)")
+    else:
+        await update.message.reply_text("I was not expecting a video. Please follow the instructions or start over with /start.")
 
-    elif state == STATE_AWAITING_AD_COUNT:
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """শুধুমাত্র টেক্সট মেসেজ হ্যান্ডেল করার জন্য"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    state = user_data.get('state')
+
+    logger.info(f"TEXT message received from user {user_id}. Current state: {state}")
+
+    if state == STATE_AWAITING_AD_COUNT:
         if update.message.text and update.message.text.isdigit() and int(update.message.text) > 0:
             count = int(update.message.text)
             set_user_data(user_id, state=STATE_PROCESSING, data_to_add={'ad_count': count})
-            await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times. You will be notified when it's done.")
             threading.Thread(target=process_video, args=(user_id, update.effective_chat.id, context)).start()
+            await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times. You will be notified when it's done.")
         else:
             await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0** (e.g., 1, 2, 3).")
-    
     elif state == STATE_PROCESSING:
         await update.message.reply_text("I am currently processing your video. Please wait until it is complete.")
-    
     else:
-        await update.message.reply_text("Something went wrong or the process was completed. Please start over by sending /start.")
+        await update.message.reply_text("I was not expecting text now. Please follow the instructions or start over with /start.")
 
 
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
 
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+# <<<<<<<< এই অংশটি নতুন করে সাজানো হয়েছে >>>>>>>>
 bot_app.add_handler(CommandHandler("start", start_command))
 bot_app.add_handler(CommandHandler("cancel", cancel_command))
-bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
+bot_app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video_message))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+# <<<<<<<< এই পর্যন্ত >>>>>>>>
 
 app = Flask(__name__)
 
