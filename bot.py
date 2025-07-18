@@ -196,12 +196,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 init_db()
 
 # <<<<<<<<<<<<<<<< মূল পরিবর্তন এখানে >>>>>>>>>>>>>>>>>>
-# আমরা এখন Application অবজেক্টটিকে একটি async context manager-এর মধ্যে ব্যবহার করছি
+# আমরা এখন Application object টি একটি async main ফাংশনের ভেতরে তৈরি করছি
 async def main():
     """বটটি initialize এবং run করার জন্য একটি async main function"""
-    context_types = ContextTypes(bot=Bot)
+    # ContextTypes আর প্রয়োজন নেই
     application = (
-        Application.builder().token(TELEGRAM_TOKEN).context_types(context_types).build()
+        Application.builder().token(TELEGRAM_TOKEN).build()
     )
     
     # হ্যান্ডলার যোগ করা
@@ -224,7 +224,7 @@ async def main():
         return "Bot is alive and running!"
 
     @app.route("/webhook", methods=["POST"])
-    async def webhook():
+    async def webhook_handler():
         await application.update_queue.put(
             Update.de_json(request.get_json(force=True), application.bot)
         )
@@ -233,7 +233,6 @@ async def main():
     # Gunicorn worker-এর জন্য uvicorn ব্যবহার করে Flask অ্যাপ চালানো
     import uvicorn
     
-    # Gunicorn নিজে থেকেই Host এবং Port সেট করে, তাই আমরা Render-এর দেওয়া মান ব্যবহার করছি
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", 10000))
 
