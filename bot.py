@@ -17,7 +17,6 @@ load_dotenv()
 
 # --- কনফিগারেশন ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 DB_NAME = 'bot_data.db' # ডেটাবেস ফাইলের নাম
 
 # --- লগিং সেটআপ ---
@@ -29,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 # --- ডেটাবেস ফাংশন (SQLite) ---
 def init_db():
-    """ডেটাবেস এবং টেবিল তৈরি করে"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -47,7 +45,6 @@ def init_db():
         logger.error(f"Failed to initialize database: {e}")
 
 def set_user_data(user_id, state=None, data=None):
-    """ব্যবহারকারীর ডেটা সেভ বা আপডেট করে"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -65,7 +62,6 @@ def set_user_data(user_id, state=None, data=None):
         logger.error(f"Failed to set user data for {user_id}: {e}")
 
 def get_user_data(user_id):
-    """ব্যবহারকারীর ডেটা নিয়ে আসে"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -82,7 +78,6 @@ def get_user_data(user_id):
     return {}
 
 def delete_user_data(user_id):
-    """ব্যবহারকারীর ডেটা মুছে ফেলে"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -99,7 +94,6 @@ STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 
 # --- মূল ভিডিও প্রসেসিং ফাংশন ---
 def process_video(user_id, chat_id, context):
-    # এই ফাংশনটি আগের মতোই থাকবে, কোনো পরিবর্তন নেই
     bot = context.bot
     temp_dir = f"temp_{user_id}"
     try:
@@ -193,28 +187,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
 
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
-init_db()  # অ্যাপ শুরু হওয়ার সময় ডেটাবেস ফাইল তৈরি করা
+init_db()
 
-app = Flask(__name__) # Flask অ্যাপ ইনিশিয়ালাইজ করা
+app = Flask(__name__)
 
 @app.route('/')
 def index():
-    """মূল URL-এ একটি মেসেজ দেখানোর জন্য, যা প্রমাণ করে বটটি চলছে"""
     return "Bot is alive and running!"
 
-# টেলিগ্রাম বট অ্যাপ্লিকেশন তৈরি করা
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start_command))
 bot_app.add_handler(CommandHandler("cancel", cancel_command))
 bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
 async def setup_webhook():
-    """ওয়েবহুক সেট করার জন্য একটি অ্যাসিঙ্ক্রোনাস ফাংশন"""
-    if WEBHOOK_URL:
-        await bot_app.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
-        logger.info(f"Webhook has been set to {WEBHOOK_URL}")
-    else:
-        logger.warning("WEBHOOK_URL not set. Skipping webhook setup.")
+    # <<<<<<<< আপনার URLটি এখানে সরাসরি বসিয়ে দেওয়া হয়েছে >>>>>>>>
+    final_webhook_url = "https://video-editor-4v54.onrender.com/webhook"
+    
+    try:
+        await bot_app.bot.set_webhook(url=final_webhook_url, allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Webhook has been forcefully set to {final_webhook_url}")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
 
 # Gunicorn সার্ভার শুরু হওয়ার সাথে সাথে ওয়েবহুক সেট করা
 try:
@@ -226,10 +220,8 @@ except RuntimeError:
     else:
         loop.run_until_complete(setup_webhook())
 
-
 @app.route('/webhook', methods=['POST'])
 async def webhook():
-    """টেলিগ্রাম থেকে আসা সব আপডেট এখানে হ্যান্ডেল করা হবে"""
     try:
         update_data = request.get_json(force=True)
         update = Update.de_json(update_data, bot_app.bot)
