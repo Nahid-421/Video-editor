@@ -1,5 +1,5 @@
 python-telegram-bot==21.0.1
-uvicorn
-starlette
+flask[async]
 gunicorn
+uvicorn
 python-dotenv
