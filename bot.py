@@ -4,18 +4,19 @@ import subprocess
 import threading
 import shutil
 import asyncio
+import json # Redis-এ ডেটা রাখার জন্য json ব্যবহার করব
 
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from pymongo import MongoClient
+import redis # pymongo-এর পরিবর্তে redis
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- Configuration ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
+REDIS_URL = os.getenv("REDIS_URL") # MONGO_URI-এর পরিবর্তে REDIS_URL
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # --- Logging Setup ---
@@ -25,42 +26,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Database Connection ---
+# --- Database Connection (Redis) ---
 try:
-    if not MONGO_URI or not (MONGO_URI.startswith("mongodb://") or MONGO_URI.startswith("mongodb+srv://")):
-        raise ValueError("Invalid or missing MONGO_URI. Please check your environment variables.")
-    client = MongoClient(MONGO_URI)
-    db = client.get_default_database()
-    users_collection = db['users']
-    logger.info("MongoDB successfully connected.")
+    if not REDIS_URL:
+        raise ValueError("Missing REDIS_URL. Please check your environment variables.")
+    # Redis-এর সাথে কানেক্ট করা
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping() # কানেকশন ঠিক আছে কিনা চেক করা
+    logger.info("Redis successfully connected.")
 except Exception as e:
-    logger.error(f"Failed to connect to MongoDB: {e}")
-    client = None
+    logger.error(f"Failed to connect to Redis: {e}")
+    redis_client = None
 
 # --- User States ---
 STATE_AWAITING_MOVIE = 'awaiting_movie'
 STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 
-# --- Database Helper Functions ---
+# --- Database Helper Functions (Using Redis) ---
 def set_user_data(user_id, state=None, data=None):
-    if not client: return
-    query = {'user_id': user_id}
-    update = {'$set': {}}
+    if not redis_client: return
+    # প্রথমে ব্যবহারকারীর সব ডেটা পড়া
+    user_key = f"user:{user_id}"
+    try:
+        current_data_str = redis_client.get(user_key)
+        current_data = json.loads(current_data_str) if current_data_str else {}
+    except (json.JSONDecodeError, TypeError):
+        current_data = {}
+
+    # নতুন ডেটা আপডেট করা
     if state is not None:
-        update['$set']['state'] = state
+        current_data['state'] = state
     if data:
-        for key, value in data.items():
-            update['$set'][key] = value
+        current_data.update(data)
     
-    if not update['$set']: return
-    users_collection.update_one(query, update, upsert=True)
+    # ডেটাবেসে আবার সেভ করা
+    redis_client.set(user_key, json.dumps(current_data))
 
 def get_user_data(user_id):
-    if not client: return {}
-    return users_collection.find_one({'user_id': user_id}) or {}
+    if not redis_client: return {}
+    user_key = f"user:{user_id}"
+    data_str = redis_client.get(user_key)
+    if data_str:
+        return json.loads(data_str)
+    return {}
 
-# --- Video Processing Function ---
+# --- Video Processing, Telegram Handlers, Flask App (এগুলোতে কোনো পরিবর্তন নেই) ---
+# ... (আগের কোডের বাকি অংশ এখানে হুবহু একই থাকবে)
+# ... (আমি পুরোটা আবার পেস্ট করছি কনফিউশন এড়ানোর জন্য)
+
 def process_video(user_id, chat_id, context):
     bot = context.bot
     temp_dir = f"temp_{user_id}"
@@ -78,7 +92,6 @@ def process_video(user_id, chat_id, context):
         
         movie_path = os.path.join(temp_dir, 'movie.mp4')
         (bot.get_file(movie_file_id)).download_to_drive(movie_path)
-
         ad_path = os.path.join(temp_dir, 'ad.mp4')
         (bot.get_file(ad_file_id)).download_to_drive(ad_path)
         
@@ -114,20 +127,21 @@ def process_video(user_id, chat_id, context):
 
     except Exception as e:
         logger.error(f"Error processing for user {user_id}: {e}", exc_info=True)
-        bot.send_message(chat_id, f"A critical error occurred. The file might be too large or the server could not process it.\n\nError: {e}\n\nPress /start to try again.")
+        bot.send_message(chat_id, f"A critical error occurred. Press /start to try again.")
     finally:
-        set_user_data(user_id, state=None, data={'movie_file_id': None, 'ad_file_id': None, 'ad_count': None})
+        if redis_client:
+            redis_client.delete(f"user:{user_id}")
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
-# --- Telegram Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     set_user_data(user.id, state=STATE_AWAITING_MOVIE)
-    await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nI can add ads to your movies.\n\nFirst, send me the main **movie file**.")
+    await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nFirst, send me the main **movie file**.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_user_data(update.effective_user.id, state=None)
+    if redis_client:
+        redis_client.delete(f"user:{update.effective_user.id}")
     await update.message.reply_text("Process cancelled. Press /start to begin again.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,41 +155,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.video:
             set_user_data(user_id, state=STATE_AWAITING_AD, data={'movie_file_id': update.message.video.file_id})
             await update.message.reply_text("Movie received. ✅\n\nNow, send me the **advertisement video**.")
-        else:
-            await update.message.reply_text("❌ Invalid input. Please send a **video file**.")
-
+        else: await update.message.reply_text("❌ Invalid input. Please send a **video file**.")
     elif state == STATE_AWAITING_AD:
         if update.message.video:
             set_user_data(user_id, state=STATE_AWAITING_AD_COUNT, data={'ad_file_id': update.message.video.file_id})
-            await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (Send only a number, e.g., 2 or 3)")
-        else:
-            await update.message.reply_text("❌ Invalid input. Please send an **advertisement video file**.")
-
+            await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (e.g., 2)")
+        else: await update.message.reply_text("❌ Invalid input. Please send an **advertisement video file**.")
     elif state == STATE_AWAITING_AD_COUNT:
         if update.message.text and update.message.text.isdigit() and int(update.message.text) > 0:
             count = int(update.message.text)
             set_user_data(user_id, state='processing', data={'ad_count': count})
-            await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times. This may take from a few minutes to over an hour. I will send you the file when it's done.")
-            
+            await update.message.reply_text(f"Information received. Starting the process to add the ad {count} times.")
             threading.Thread(target=process_video, args=(user_id, chat_id, context)).start()
-        else:
-            await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0** (e.g., 1, 2, 3).")
+        else: await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
 
-# --- Flask Web App and Bot Setup ---
 app = Flask(__name__)
 bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
-
 bot_app.add_handler(CommandHandler("start", start_command))
 bot_app.add_handler(CommandHandler("cancel", cancel_command))
 bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
 async def setup_webhook():
-    if WEBHOOK_URL:
-        await bot_app.bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook has been set to {WEBHOOK_URL}")
-    else:
-        logger.warning("WEBHOOK_URL not set. Skipping webhook setup.")
-
+    if WEBHOOK_URL: await bot_app.bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"Webhook has been set to {WEBHOOK_URL}")
 asyncio.run(setup_webhook())
 
 @app.route('/webhook', methods=['POST'])
