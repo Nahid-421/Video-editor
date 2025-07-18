@@ -1,7 +1,5 @@
 python-telegram-bot==21.0.1
-flask[async]
-gunicorn
 uvicorn
-a2wsgi
+starlette
+gunicorn
 python-dotenv
-asyncio
