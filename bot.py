@@ -195,29 +195,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
 
-ptb_app = Application.builder().token(TELEGRAM_TOKEN).build()
-ptb_app.add_handler(CommandHandler("start", start_command))
-ptb_app.add_handler(CommandHandler("cancel", cancel_command))
-ptb_app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
-ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+# <<<<<<<<<<<<<<<< মূল পরিবর্তন এখানে >>>>>>>>>>>>>>>>>>
+# আমরা এখন Application অবজেক্টটিকে একটি async context manager-এর মধ্যে ব্যবহার করছি
+async def main():
+    """বটটি initialize এবং run করার জন্য একটি async main function"""
+    context_types = ContextTypes(bot=Bot)
+    application = (
+        Application.builder().token(TELEGRAM_TOKEN).context_types(context_types).build()
+    )
+    
+    # হ্যান্ডলার যোগ করা
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-app = Flask(__name__)
+    # বট initialize করা
+    await application.initialize()
+    
+    # ওয়েবহুক সেট করা
+    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+    
+    # Flask অ্যাপ তৈরি করা
+    app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return "Bot is alive and running!"
+    @app.route("/")
+    def index():
+        return "Bot is alive and running!"
 
-@app.route('/webhook', methods=['POST'])
-async def webhook():
-    try:
-        await ptb_app.update_queue.put(Update.de_json(request.get_json(force=True), ptb_app.bot))
-    except Exception as e:
-        logger.error(f"Error in webhook: {e}", exc_info=True)
-    return 'ok'
+    @app.route("/webhook", methods=["POST"])
+    async def webhook():
+        await application.update_queue.put(
+            Update.de_json(request.get_json(force=True), application.bot)
+        )
+        return "ok"
 
-async def bot_startup():
-    await ptb_app.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+    # Gunicorn worker-এর জন্য uvicorn ব্যবহার করে Flask অ্যাপ চালানো
+    import uvicorn
+    
+    # Gunicorn নিজে থেকেই Host এবং Port সেট করে, তাই আমরা Render-এর দেওয়া মান ব্যবহার করছি
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 10000))
 
-# নতুন uvicorn worker এই ব্লকের মাধ্যমে lifecycle পরিচালনা করবে
-if __name__ != "__main__":
-    asyncio.run(bot_startup())
+    web_server = uvicorn.Server(
+        config=uvicorn.Config(
+            app=app,
+            host=host,
+            port=port,
+            log_level="info",
+        )
+    )
+
+    # বট এবং ওয়েবসার্ভার একসাথে চালানো
+    async with application:
+        await web_server.serve()
+
+if __name__ == "__main__":
+    asyncio.run(main())
