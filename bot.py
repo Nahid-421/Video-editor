@@ -6,11 +6,10 @@ import shutil
 import asyncio
 import sqlite3
 import json
-import re
 import time as a_time
 
 from flask import Flask, request
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
@@ -30,7 +29,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- ডেটাবেস ফাংশন (SQLite) ---
-# (এই অংশ অপরিবর্তিত)
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -65,7 +63,6 @@ def set_user_data(user_id, state=None, data_to_add=None):
         )
         conn.commit()
         conn.close()
-        logger.info(f"User {user_id}: State set to '{current_state}'.")
     except Exception as e:
         logger.error(f"Failed to set user data for {user_id}: {e}", exc_info=True)
 
@@ -90,7 +87,6 @@ def delete_user_data(user_id):
         conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
-        logger.info(f"Data for user {user_id} deleted.")
     except Exception as e:
         logger.error(f"Failed to delete user data for {user_id}: {e}", exc_info=True)
 
@@ -100,25 +96,21 @@ STATE_AWAITING_AD = 'awaiting_ad'
 STATE_AWAITING_AD_COUNT = 'awaiting_ad_count'
 STATE_PROCESSING = 'processing'
 
-# --- মূল ভিডিও প্রসেসিং ফাংশন (প্রোগ্রেস বার সহ) ---
-def process_video(user_id, chat_id, context):
-    bot = context.bot
+# --- মূল ভিডিও প্রসেসিং ফাংশন (প্রোগ্রেস বার এবং এরর সমাধান সহ) ---
+def process_video(user_id, chat_id, token):
     temp_dir = f"temp_{user_id}"
     progress_message = None
+    bot = Bot(token=token)
 
     # <<<<<<< এই অংশটিই সব সমস্যার সমাধান >>>>>>>
-    def run_async_from_thread(coro):
+    def run_async_in_thread(coro):
         """থ্রেডের ভেতর থেকে একটি async ফাংশন নিরাপদে চালানোর জন্য"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            return asyncio.run(coro)
-        except RuntimeError as e:
-            # যদি একটি লুপ আগে থেকেই চলতে থাকে
-            if "cannot run loop while another loop is running" in str(e):
-                # এটি একটি workaround, তবে এই ক্ষেত্রে কাজ করবে
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                return loop.run_until_complete(coro)
-            raise e
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
             
     try:
         user_data = get_user_data(user_id).get('data', {})
@@ -130,15 +122,13 @@ def process_video(user_id, chat_id, context):
             raise ValueError("Required data not found for processing.")
 
         os.makedirs(temp_dir, exist_ok=True)
-        progress_message = run_async_from_thread(bot.send_message(chat_id, "Downloading files... 📥"))
+        progress_message = run_async_in_thread(bot.send_message(chat_id, "Downloading files... 📥"))
         
         movie_path = os.path.join(temp_dir, 'movie.mp4')
-        run_async_from_thread(bot.get_file(movie_file_id).download_to_drive(movie_path))
+        run_async_in_thread(bot.get_file(movie_file_id).download_to_drive(movie_path))
         ad_path = os.path.join(temp_dir, 'ad.mp4')
-        run_async_from_thread(bot.get_file(ad_file_id).download_to_drive(ad_path))
+        run_async_in_thread(bot.get_file(ad_file_id).download_to_drive(ad_path))
         
-        run_async_from_thread(bot.edit_message_text("Download complete. Processing video... ⚙️", chat_id=chat_id, message_id=progress_message.message_id))
-
         ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', movie_path]
         result = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         total_duration = float(result.stdout)
@@ -158,38 +148,39 @@ def process_video(user_id, chat_id, context):
 
         output_path = os.path.join(temp_dir, 'final_movie.mp4')
         
-        # <<<<<<< রিয়েল-টাইম প্রোগ্রেস দেখানোর জন্য FFmpeg কমান্ড >>>>>>>
         ffmpeg_cmd = ['ffmpeg', '-y', '-progress', '-', '-nostats', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', output_path]
         
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding="utf-8")
         
         last_update_time = a_time.time()
+        last_percentage = -1
         for line in process.stdout:
             if "out_time_ms" in line:
                 current_time_ms = int(line.strip().split("=")[1])
                 current_time_s = current_time_ms / 1_000_000
                 percentage = int((current_time_s / total_duration) * 100)
                 
-                # প্রতি ৫ সেকেন্ডে বা ৫% পর পর মেসেজ এডিট করা
-                if a_time.time() - last_update_time > 5:
+                if percentage > last_percentage and a_time.time() - last_update_time > 3:
                     try:
-                        run_async_from_thread(bot.edit_message_text(f"Processing... {percentage}% complete ⚙️", chat_id=chat_id, message_id=progress_message.message_id))
+                        run_async_in_thread(bot.edit_message_text(f"Processing video... {percentage}% ⚙️", chat_id=chat_id, message_id=progress_message.message_id))
+                        last_percentage = percentage
                         last_update_time = a_time.time()
                     except Exception as e:
-                        logger.warning(f"Could not edit message: {e}")
+                        logger.warning(f"Could not edit progress message: {e}")
         
-        process.wait() # FFmpeg শেষ হওয়ার জন্য অপেক্ষা করা
+        process.wait()
 
-        run_async_from_thread(bot.edit_message_text("Processing complete! ✅\nUploading the file...", chat_id=chat_id, message_id=progress_message.message_id))
+        run_async_in_thread(bot.edit_message_text("Processing complete! ✅\nUploading the file...", chat_id=chat_id, message_id=progress_message.message_id))
         with open(output_path, 'rb') as final_video:
-            run_async_from_thread(bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120))
+            run_async_in_thread(bot.send_video(chat_id, video=final_video, caption="Here is your edited movie.", read_timeout=120, write_timeout=120))
 
     except Exception as e:
         logger.error(f"Error in process_video thread for user {user_id}:", exc_info=True)
+        error_message = "A critical error occurred. Please try again with /start."
         if progress_message:
-            run_async_from_thread(bot.edit_message_text("A critical error occurred. Please try again with /start.", chat_id=chat_id, message_id=progress_message.message_id))
+            run_async_in_thread(bot.edit_message_text(error_message, chat_id=chat_id, message_id=progress_message.message_id))
         else:
-            run_async_from_thread(bot.send_message(chat_id, "A critical error occurred. Please try again with /start."))
+            run_async_in_thread(bot.send_message(chat_id, error_message))
     finally:
         delete_user_data(user_id)
         if os.path.exists(temp_dir):
@@ -197,13 +188,12 @@ def process_video(user_id, chat_id, context):
 
 # --- টেলিগ্রাম হ্যান্ডলার ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    set_user_data(user.id, state=STATE_AWAITING_MOVIE, data_to_add={'user_id': user.id})
-    await update.message.reply_html(f"👋 Hello {user.mention_html()}!\n\nFirst, send me the main **movie file**.")
+    set_user_data(update.effective_user.id, state=STATE_AWAITING_MOVIE, data_to_add={'user_id': update.effective_user.id})
+    await update.message.reply_html(f"👋 Hello {update.effective_user.mention_html()}!\n\nFirst, send me the main **movie file**.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delete_user_data(update.effective_user.id)
-    await update.message.reply_text("Process cancelled. You can start a new one by sending /start.")
+    await update.message.reply_text("Process cancelled. Start again with /start.")
 
 async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -214,9 +204,9 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Movie received. ✅\n\nNow, send me the **advertisement video**.")
     elif state == STATE_AWAITING_AD:
         set_user_data(user_id, state=STATE_AWAITING_AD_COUNT, data_to_add={'ad_file_id': update.message.video.file_id})
-        await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** you want to place the ad? (e.g., 2)")
+        await update.message.reply_text("Ad received. ✅\n\nNow, tell me **how many times** to place the ad? (e.g., 2)")
     else:
-        await update.message.reply_text("I was not expecting a video. Please start over with /start.")
+        await update.message.reply_text("I wasn't expecting a video. Please start over with /start.")
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -226,14 +216,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if update.message.text and update.message.text.isdigit() and int(update.message.text) > 0:
             count = int(update.message.text)
             set_user_data(user_id, state=STATE_PROCESSING, data_to_add={'ad_count': count})
-            await update.message.reply_text(f"Information received. Starting the process... You will be notified at each step.")
-            threading.Thread(target=process_video, args=(user_id, update.effective_chat.id, context)).start()
+            await update.message.reply_text(f"Information received. Starting the process...")
+            # থ্রেড চালু করার সময় টোকেনটি পাস করা হচ্ছে
+            threading.Thread(target=process_video, args=(user_id, update.effective_chat.id, TELEGRAM_TOKEN)).start()
         else:
             await update.message.reply_text("❌ Invalid input. Please send a **number greater than 0**.")
     elif state == STATE_PROCESSING:
         await update.message.reply_text("I am currently processing your video. Please wait.")
     else:
-        await update.message.reply_text("I was not expecting text now. Please start over with /start.")
+        await update.message.reply_text("I wasn't expecting text now. Please start over with /start.")
 
 # --- Flask ওয়েব অ্যাপ এবং বট চালু করা ---
 init_db()
